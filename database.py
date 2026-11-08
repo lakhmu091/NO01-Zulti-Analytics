@@ -1,97 +1,36 @@
-
-import sqlite3
-import json
-import hashlib
+import sqlite3, json, hashlib
 from pathlib import Path
 import pandas as pd
 
 DB_PATH = Path(__file__).parent / "data" / "no01.sqlite3"
 
-def connect():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
-
 def init_db():
-    with connect() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS draws (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                draw_date TEXT,
-                draw_id TEXT,
-                source TEXT,
-                numbers_json TEXT NOT NULL,
-                fingerprint TEXT UNIQUE
-            )
-        """)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS draws (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            draw_date TEXT NOT NULL, draw_id TEXT DEFAULT '',
+            source TEXT DEFAULT 'Manual', numbers_json TEXT NOT NULL,
+            fingerprint TEXT UNIQUE NOT NULL)''')
 
-def save_draws(df):
-    init_db()
-    saved = 0
-
-    with connect() as con:
-        for _, row in df.iterrows():
-            try:
-                nums = row.get("numbers")
-
-                if isinstance(nums, str):
-                    nums = [int(x.strip()) for x in nums.split(",")]
-                elif isinstance(nums, (list, tuple)):
-                    nums = [int(x) for x in nums]
-                else:
-                    continue
-
-                # Exactly 8 unique positive numbers
-                if len(nums) != 8:
-                    continue
-
-                if len(nums) != len(set(nums)):
-                    continue
-
-                if min(nums) < 1 or max(nums) > 100:
-                    continue
-
-                date = str(row.get("draw_date", ""))
-                draw_id = str(row.get("draw_id", ""))
-                source = str(row.get("source", "unknown"))
-
-                fingerprint = hashlib.sha256(
-                    (date + "|" + draw_id + "|" +
-                     ",".join(map(str, sorted(nums)))).encode()
-                ).hexdigest()
-
-                con.execute("""
-                    INSERT OR IGNORE INTO draws
-                    (draw_date, draw_id, source, numbers_json, fingerprint)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    date, draw_id, source,
-                    json.dumps(sorted(nums)), fingerprint
-                ))
-
-                saved += con.execute(
-                    "SELECT changes()"
-                ).fetchone()[0]
-
-            except (ValueError, TypeError):
-                continue
-
-    return saved
+def save_draw(draw_date, draw_id, numbers, source="Manual"):
+    nums = sorted(int(n) for n in numbers)
+    if len(nums) != 6 or len(set(nums)) != 6 or min(nums) < 1 or max(nums) > 45:
+        return False, "Expected six unique numbers in range 1–45."
+    payload = json.dumps(nums)
+    fingerprint = hashlib.sha256(f"{draw_date}|{draw_id}|{payload}".encode()).hexdigest()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("INSERT INTO draws(draw_date,draw_id,source,numbers_json,fingerprint) VALUES(?,?,?,?,?)",
+                        (draw_date, draw_id, source, payload, fingerprint))
+        return True, "Saved"
+    except sqlite3.IntegrityError:
+        return False, "Duplicate"
 
 def load_draws():
     init_db()
-
-    with connect() as con:
-        df = pd.read_sql_query(
-            """SELECT draw_date, draw_id, source, numbers_json
-               FROM draws ORDER BY draw_date, id""",
-            con
-        )
-
-    if df.empty:
-        return pd.DataFrame(
-            columns=["draw_date", "draw_id", "source", "numbers"]
-        )
-
-    df["numbers"] = df["numbers_json"].apply(json.loads)
-
-    return df.drop(columns=["numbers_json"])
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute("SELECT draw_date,draw_id,source,numbers_json FROM draws ORDER BY draw_date DESC,id DESC").fetchall()
+    return pd.DataFrame([{"draw_date": r[0], "draw_id": r[1], "source": r[2],
+                          "numbers": " ".join(map(str, json.loads(r[3])))} for r in rows],
+                        columns=["draw_date", "draw_id", "source", "numbers"])
